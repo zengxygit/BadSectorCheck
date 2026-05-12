@@ -27,16 +27,14 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\BadSectorCheckDll\DiskCheckBase.cpp" />
     <ClCompile Include="BadSectorCheck.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\BadSectorCheckDll\DiskCheckBase.h" />
-    <QtMoc Include="BadSectorCheck.h" />
+    <QtRcc Include="BadSectorCheck.qrc" />
   </ItemGroup>
   <ItemGroup>
-    <QtRcc Include="BadSectorCheck.qrc" />
+    <QtMoc Include="BadSectorCheck.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{D315BD92-D50C-4BAD-A621-CBE05E833AA9}</ProjectGuid>
@@ -141,8 +139,8 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <Link>
-      <AdditionalLibraryDirectories>../../Output/lib_$(Configuration);../../shared/Output/lib_Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>DCNTFSLib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>../../Output/Release;../../Output/lib_$(Configuration);../../shared/Output/lib_Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>DCNTFSLib.lib;BadSectorCheckDll.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ClCompile>
       <AdditionalIncludeDirectories>../../DiskBackup/include</AdditionalIncludeDirectories>
