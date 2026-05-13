@@ -8,6 +8,8 @@
 #include "../../DiskBackup/include/DiskEntry.itf"
 #include "../../DiskBackup/include/DiskGeometry.itf"
 #include "../../DiskBackup/include/PartitionManager.itf"
+#include "../../DiskBackup/include/FileSystemPartition.itf"
+#include "../../DiskBackup/include/IVolumeEntry.h"
 
 #define ONE_TIMES_TEST_SECTOR  (256 * 2)
 
@@ -76,6 +78,35 @@ std::vector<DiskCheckBase::DiskInfo> DiskCheckBase::EnumerateDisks()
         info.startSector   = (int64_t)pDisk->GetStartSector();
         info.sectorCount   = (int64_t)pDisk->GetSectorCount();
         info.bytesPerSector = pGeom ? pGeom->GetBytesPerSector() : 512;
+
+        // 枚举磁盘上的分区
+        CMomPtr<IIterator> pPartItr = pPM->NewIterator();
+        if (pPartItr)
+        {
+            IManagerItem* pPartItem = nullptr;
+            while ((pPartItem = (IManagerItem*)pPartItr->Next()) != nullptr)
+            {
+                IPartitionEntry* pPartEntry = pPartItem->GetInterface(IPartitionEntry);
+                if (!pPartEntry) continue;
+
+                // 跳过空分区类型
+                if (pPartEntry->GetPartitionType() == PART_Empty) continue;
+
+                IFileSystemPartition* pFS  = pPartItem->GetInterface(IFileSystemPartition);
+                IVolumeEntryInfo*     pVol = pPartItem->GetInterface(IVolumeEntryInfo);
+
+                PartitionInfo pinfo;
+                pinfo.diskIndex     = info.index;
+                pinfo.systemName    = pPartEntry->GetSystemName() ? pPartEntry->GetSystemName() : "";
+                pinfo.label         = (pFS && pFS->GetLabel()) ? pFS->GetLabel() : "";
+                pinfo.driveLetter   = pVol ? pVol->GetDriveLetter() : 0;
+                pinfo.startSector   = (int64_t)pPartEntry->GetStartSector();
+                pinfo.sectorCount   = (int64_t)pPartEntry->GetSectorCount();
+                pinfo.bytesPerSector = info.bytesPerSector;
+                info.partitions.push_back(pinfo);
+            }
+        }
+
         result.push_back(info);
     }
 
@@ -241,6 +272,106 @@ TBRESULT DiskCheckBase::DoCheck(U32 uDiskIndex)
     // ── 清理 ─────────────────────────────────────────────────────
     m_drvIO.CloseDisk();
     m_pDevMgr    = nullptr;
+    m_apDevModule = NULL;
+    m_bIsRunning  = false;
+    return iResult;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 枚举所有分区（跨磁盘平铺）
+// ─────────────────────────────────────────────────────────────────
+std::vector<DiskCheckBase::PartitionInfo> DiskCheckBase::EnumeratePartitions()
+{
+    std::vector<PartitionInfo> result;
+    std::vector<DiskInfo> disks = EnumerateDisks();
+    for (const auto& d : disks)
+        for (const auto& p : d.partitions)
+            result.push_back(p);
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 执行坏扇区检测 —— 分区扫描
+// ─────────────────────────────────────────────────────────────────
+TBRESULT DiskCheckBase::DoCheckPartition(int diskIndex, int64_t startSector, int64_t sectorCount)
+{
+    if (m_bIsRunning)
+        return BP_ERR_SUCCESS;
+
+    m_bIsCancel  = false;
+    m_bIsRunning = true;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_vectBadSecs.clear();
+    }
+
+    TBRESULT iResult = BP_ERR_SUCCESS;
+
+    do {
+        iResult = OpenDevMgrModule(m_apDevModule, &m_pDevMgr);
+        if (iResult != 0) break;
+        if (m_pDevMgr == NULL) { iResult = BP_ERR_CREATE_DEVICE_MANAGER; break; }
+
+        CHardDriveIOSetting drvIoSetting(m_pDevMgr);
+        CHardDriveIO::LoadSetting(drvIoSetting);
+
+        // 直接使用传入的分区范围
+        m_u64StartSector = (U64)startSector;
+        m_u64SectorCount = (U64)sectorCount;
+
+        if (!m_drvIO.OpenDisk(diskIndex)) { iResult = -1; break; }
+
+        m_u32SectorSize = m_drvIO.GetSectorSize();
+        if (m_u32SectorSize == 0) { iResult = -1; break; }
+
+        const U64 stepSize     = 10ULL * 1024 * 1024;
+        const U64 minStartSize =  2ULL * 1024 * 1024;
+        U64 minSectors  = minStartSize / m_u32SectorSize;
+        U64 stepSectors = stepSize     / m_u32SectorSize;
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_u64CurrentSector = m_u64StartSector;
+        }
+
+        while (true)
+        {
+            int64_t curSector;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                curSector = m_u64CurrentSector;
+            }
+            if ((U64)curSector >= m_u64StartSector + m_u64SectorCount) break;
+            if (m_bIsCancel) { iResult = BP_ERR_CANCELED_COMMAND; break; }
+
+            S64 nHowManySectors = ONE_TIMES_TEST_SECTOR;
+            if ((U64)nHowManySectors + curSector > m_u64StartSector + m_u64SectorCount)
+                nHowManySectors = (S64)(m_u64StartSector + m_u64SectorCount - curSector);
+
+            BOOL bIsVerify = m_drvIO.VerifySector(curSector, nHowManySectors);
+
+            if (m_bIsCancel) { iResult = BP_ERR_CANCELED_COMMAND; break; }
+
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!bIsVerify)
+                {
+                    // 坏扇区记录为相对于分区 startSector 的偏移
+                    m_vectBadSecs.push_back(curSector - (int64_t)m_u64StartSector + nHowManySectors / 2);
+                }
+
+                U64 relPos = (U64)curSector - m_u64StartSector;
+                if (m_bQuick && relPos > minSectors)
+                    m_u64CurrentSector = curSector + stepSectors;
+                else
+                    m_u64CurrentSector = curSector + nHowManySectors;
+            }
+        }
+
+    } while (0);
+
+    m_drvIO.CloseDisk();
+    m_pDevMgr     = nullptr;
     m_apDevModule = NULL;
     m_bIsRunning  = false;
     return iResult;

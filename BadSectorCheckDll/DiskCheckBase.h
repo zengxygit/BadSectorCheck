@@ -21,6 +21,17 @@ class IManager;
 class BADSECTORCHECK_API DiskCheckBase
 {
 public:
+	// 分区枚举信息
+	struct PartitionInfo {
+		int         diskIndex;      // 所属物理磁盘编号
+		std::string systemName;     // 系统名称，如 "\\.\C:"
+		std::string label;          // 卷标（可能为空）
+		char        driveLetter;    // 盘符，如 'C'；0 表示无盘符
+		int64_t     startSector;    // 绝对起始扇区
+		int64_t     sectorCount;    // 扇区数
+		uint32_t    bytesPerSector; // 每扇区字节数
+	};
+
 	// 磁盘枚举信息
 	struct DiskInfo {
 		int      index;           // PHYSICALDRIVE 编号
@@ -28,6 +39,7 @@ public:
 		int64_t  startSector;     // 可用区起始扇区（GPT=34, MBR=0）
 		int64_t  sectorCount;     // 扇区个数（与 IDeviceEntry::GetSectorCount 口径一致）
 		uint32_t bytesPerSector;  // 每扇区字节数
+		std::vector<PartitionInfo> partitions; // 磁盘上的分区列表
 	};
 
 	DiskCheckBase() {}
@@ -36,11 +48,20 @@ public:
 	// 打开设备管理器模块
 	int OpenDevMgrModule(CMomPtr<IDeviceManagerModule>& apDevModule, IManager** ppDevMgr);
 
-	// 枚举所有物理磁盘
+	// 枚举所有物理磁盘（含各磁盘下的分区）
 	static std::vector<DiskInfo> EnumerateDisks();
 
-	// 执行坏扇区检测（在子线程中调用）
+	// 枚举所有分区（跨磁盘平铺，用于 Scan Partition 列表）
+	static std::vector<PartitionInfo> EnumeratePartitions();
+
+	// 执行坏扇区检测 —— 整盘扫描（在子线程中调用）
 	TBRESULT DoCheck(U32 uDiskIndex);
+
+	// 执行坏扇区检测 —— 分区扫描（在子线程中调用）
+	// diskIndex:   物理盘编号（打开对应 PHYSICALDRIVE）
+	// startSector: 分区绝对起始扇区
+	// sectorCount: 分区扇区数
+	TBRESULT DoCheckPartition(int diskIndex, int64_t startSector, int64_t sectorCount);
 
 	// 取消检测
 	void Cancel() { m_bIsCancel = true; }

@@ -80,9 +80,21 @@ DiskCheckThread::DiskCheckThread(DiskCheckBase* pCheck, int diskIndex, QObject* 
 {
 }
 
+DiskCheckThread::DiskCheckThread(DiskCheckBase* pCheck, int diskIndex,
+                                 int64_t startSector, int64_t sectorCount,
+                                 QObject* parent)
+    : QThread(parent), m_pCheck(pCheck), m_diskIndex(diskIndex),
+      m_bPartitionMode(true), m_startSector(startSector), m_sectorCount(sectorCount)
+{
+}
+
 void DiskCheckThread::run()
 {
-    int result = m_pCheck->DoCheck((U32)m_diskIndex);
+    int result;
+    if (m_bPartitionMode)
+        result = m_pCheck->DoCheckPartition(m_diskIndex, m_startSector, m_sectorCount);
+    else
+        result = m_pCheck->DoCheck((U32)m_diskIndex);
     emit checkFinished(result);
 }
 
@@ -169,8 +181,8 @@ void BadSectorCheck::buildUI()
     rightVBox->setContentsMargins(0, 0, 0, 0);
     rightVBox->setSpacing(10);
 
-    // 磁盘选择
-    QLabel* diskLbl = new QLabel(tr("Disk:"), central);
+    // 目标选择（单选决定该下拉是磁盘列表还是分区列表）
+    QLabel* diskLbl = new QLabel(tr("Target:"), central);
     diskLbl->setStyleSheet("font-size:13px;");
 
     m_pDiskCombo = new QComboBox(central);
@@ -178,7 +190,7 @@ void BadSectorCheck::buildUI()
     m_pDiskCombo->setStyleSheet("font-size:12px;");
 
     // 快速检测
-    m_pQuickCheck = new QCheckBox(tr("Quick check"), central);
+    m_pQuickCheck = new QCheckBox(tr("Perform a quick check process"), central);
     m_pQuickCheck->setChecked(true);
     m_pQuickCheck->setStyleSheet("font-size:12px;");
 
@@ -217,15 +229,39 @@ void BadSectorCheck::buildUI()
     connect(m_pStartBtn,  &QPushButton::clicked, this, &BadSectorCheck::onStartClicked);
     connect(m_pStopBtn,   &QPushButton::clicked, this, &BadSectorCheck::onStopClicked);
 
-    // 磁盘切换时刷新名称
-    connect(m_pDiskCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, [this](int idx) {
-        QVariant v = m_pDiskCombo->itemData(idx);
-        m_pDiskName->setText(m_pDiskCombo->itemData(idx, Qt::UserRole + 1).toString());
+    m_pScanDisk = new QRadioButton(tr("Scan Disk"), central);
+    m_pScanPartition = new QRadioButton(tr("Scan Partition"), central);
+    m_pScanDisk->setChecked(true);
+
+    connect(m_pScanDisk, &QRadioButton::toggled, this, [this](bool) {
+        refreshTargetCombo();
+        resetGrid();
+    });
+    connect(m_pScanPartition, &QRadioButton::toggled, this, [this](bool) {
+        refreshTargetCombo();
         resetGrid();
     });
 
+    // 单一下拉框切换项时更新描述
+    connect(m_pDiskCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int idx) {
+                Q_UNUSED(idx);
+                m_pDiskName->setText(m_pDiskCombo->itemData(m_pDiskCombo->currentIndex(), Qt::UserRole + 1).toString());
+                resetGrid();
+            });
+
     // 组装右侧布局
+    // 单选行（Scan Disk / Scan Partition）
+    {
+        QHBoxLayout* modeRow = new QHBoxLayout();
+        modeRow->setContentsMargins(0, 0, 0, 0);
+        modeRow->setSpacing(12);
+        modeRow->addWidget(m_pScanDisk);
+        modeRow->addWidget(m_pScanPartition);
+        modeRow->addStretch();
+        rightVBox->addLayout(modeRow);
+    }
+
     rightVBox->addWidget(diskLbl);
     rightVBox->addWidget(m_pDiskCombo);
     rightVBox->addWidget(m_pQuickCheck);
@@ -252,35 +288,79 @@ void BadSectorCheck::buildUI()
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 枚举磁盘，填充下拉框
+// 根据单选模式刷新“唯一目标下拉框”
 // ═══════════════════════════════════════════════════════════════════
-void BadSectorCheck::populateDiskList()
+void BadSectorCheck::refreshTargetCombo()
 {
     m_pDiskCombo->clear();
 
-    std::vector<DiskCheckBase::DiskInfo> disks = DiskCheckBase::EnumerateDisks();
-    if (disks.empty())
+    if (m_pScanPartition && m_pScanPartition->isChecked())
     {
-        m_pDiskCombo->addItem(tr("(No disk found)"));
-        m_pStartBtn->setEnabled(false);
-        return;
+        std::vector<DiskCheckBase::PartitionInfo> parts = DiskCheckBase::EnumeratePartitions();
+
+        // ① 只保留有盘符的分区（与 EPM 一致：跳过 EFI/MSR/恢复等无盘符分区）
+        struct PartItem {
+            QString  text;
+            DiskCheckBase::PartitionInfo info;
+        };
+        std::vector<PartItem> items;
+        for (const auto& p : parts)
+        {
+            if (p.driveLetter == 0) continue;   // 无盘符，跳过
+
+            int64_t partBytes = (int64_t)p.sectorCount * p.bytesPerSector;
+            QString text = QString("%1: (%2)").arg(QChar(p.driveLetter))
+                                              .arg(formatBytes(partBytes));
+            items.push_back({ text, p });
+        }
+
+        // ② 按盘符字母序排序（与 EPM 气泡排序逻辑等价）
+        std::sort(items.begin(), items.end(), [](const PartItem& a, const PartItem& b){
+            return a.info.driveLetter < b.info.driveLetter;
+        });
+
+        for (const auto& item : items)
+        {
+            m_pDiskCombo->addItem(item.text);
+            int idx = m_pDiskCombo->count() - 1;
+            m_pDiskCombo->setItemData(idx, 1,                                    Qt::UserRole);
+            m_pDiskCombo->setItemData(idx, QString::fromStdString(item.info.systemName), Qt::UserRole + 1);
+            m_pDiskCombo->setItemData(idx, item.info.diskIndex,                  Qt::UserRole + 2);
+            m_pDiskCombo->setItemData(idx, (qlonglong)item.info.startSector,     Qt::UserRole + 3);
+            m_pDiskCombo->setItemData(idx, (qlonglong)item.info.sectorCount,     Qt::UserRole + 4);
+        }
+    }
+    else
+    {
+        std::vector<DiskCheckBase::DiskInfo> disks = DiskCheckBase::EnumerateDisks();
+        for (const auto& d : disks)
+        {
+            int64_t bytes = (d.startSector + d.sectorCount) * (int64_t)d.bytesPerSector;
+            QString text = QString("Disk %1 (%2)").arg(d.index).arg(formatBytes(bytes));
+            m_pDiskCombo->addItem(text);
+            int idx = m_pDiskCombo->count() - 1;
+            // UserRole:   type (0=disk)
+            // UserRole+1: 描述文本
+            // UserRole+2: diskIndex
+            m_pDiskCombo->setItemData(idx, 0, Qt::UserRole);
+            m_pDiskCombo->setItemData(idx, QString::fromStdString(d.name), Qt::UserRole + 1);
+            m_pDiskCombo->setItemData(idx, d.index, Qt::UserRole + 2);
+        }
     }
 
-    for (const auto& d : disks)
-    {
-        // 物理容量 = (startSector + sectorCount) * bytesPerSector
-        int64_t physicalBytes = (d.startSector + d.sectorCount) * (int64_t)d.bytesPerSector;
-        QString display = QString("Disk %1  %2").arg(d.index).arg(formatBytes(physicalBytes));
-        // UserRole: 真实物理盘号；UserRole+1: 系统名
-        m_pDiskCombo->addItem(display);
-        int idx = m_pDiskCombo->count() - 1;
-        m_pDiskCombo->setItemData(idx, d.index, Qt::UserRole);
-        m_pDiskCombo->setItemData(idx, QString::fromStdString(d.name), Qt::UserRole + 1);
-    }
-
-    // 触发一次 currentIndexChanged，更新磁盘名称标签
     if (m_pDiskCombo->count() > 0)
         m_pDiskName->setText(m_pDiskCombo->itemData(0, Qt::UserRole + 1).toString());
+    else
+        m_pDiskName->setText("-");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 初始化目标列表
+// ═══════════════════════════════════════════════════════════════════
+void BadSectorCheck::populateDiskList()
+{
+    refreshTargetCombo();
+    m_pStartBtn->setEnabled(m_pDiskCombo->count() > 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -307,34 +387,45 @@ void BadSectorCheck::resetGrid()
 // ═══════════════════════════════════════════════════════════════════
 void BadSectorCheck::onStartClicked()
 {
-    int comboIndex = m_pDiskCombo->currentIndex();
-    if (comboIndex < 0) return;
-
-    int diskIndex = m_pDiskCombo->itemData(comboIndex, Qt::UserRole).toInt();
-    if (diskIndex < 0) return;
-
     resetGrid();
 
-    // 重新创建 DiskCheckBase（每次检测独立实例）
     delete m_pDiskCheck;
     m_pDiskCheck = new DiskCheckBase();
     m_pDiskCheck->SetQuick(m_pQuickCheck->isChecked());
 
-    m_pCheckThread = new DiskCheckThread(m_pDiskCheck, diskIndex, this);
+    int comboIndex = m_pDiskCombo->currentIndex();
+    if (comboIndex < 0) return;
+
+    int targetType = m_pDiskCombo->itemData(comboIndex, Qt::UserRole).toInt();
+    if (targetType == 1)
+    {
+        int diskIndex = m_pDiskCombo->itemData(comboIndex, Qt::UserRole + 2).toInt();
+        int64_t startSector = m_pDiskCombo->itemData(comboIndex, Qt::UserRole + 3).toLongLong();
+        int64_t sectorCount = m_pDiskCombo->itemData(comboIndex, Qt::UserRole + 4).toLongLong();
+        if (diskIndex < 0 || sectorCount <= 0) return;
+        m_pCheckThread = new DiskCheckThread(m_pDiskCheck, diskIndex, startSector, sectorCount, this);
+    }
+    else
+    {
+        int diskIndex = m_pDiskCombo->itemData(comboIndex, Qt::UserRole + 2).toInt();
+        if (diskIndex < 0) return;
+        m_pCheckThread = new DiskCheckThread(m_pDiskCheck, diskIndex, this);
+    }
+
     connect(m_pCheckThread, &DiskCheckThread::checkFinished,
             this, &BadSectorCheck::onCheckFinished);
     connect(m_pCheckThread, &QThread::finished,
             m_pCheckThread, &QObject::deleteLater);
 
     m_tStartTime = time(nullptr);
-
     m_pCheckThread->start();
-
     m_timer.start(UPDATE_INTERVAL);
 
     m_pStartBtn->hide();
     m_pStopBtn->show();
     m_pDiskCombo->setEnabled(false);
+    if (m_pScanDisk)       m_pScanDisk->setEnabled(false);
+    if (m_pScanPartition)  m_pScanPartition->setEnabled(false);
     m_pQuickCheck->setEnabled(false);
 }
 
@@ -360,6 +451,8 @@ void BadSectorCheck::onStopClicked()
     m_pStopBtn->hide();
     m_pStartBtn->show();
     m_pDiskCombo->setEnabled(true);
+    if (m_pScanDisk)      m_pScanDisk->setEnabled(true);
+    if (m_pScanPartition) m_pScanPartition->setEnabled(true);
     m_pQuickCheck->setEnabled(true);
 }
 
@@ -432,6 +525,8 @@ void BadSectorCheck::onCheckFinished(int result)
     }
 
     m_pDiskCombo->setEnabled(true);
+    if (m_pScanDisk)      m_pScanDisk->setEnabled(true);
+    if (m_pScanPartition) m_pScanPartition->setEnabled(true);
     m_pQuickCheck->setEnabled(true);
 
     qDebug() << "DoCheck finished, result=" << result

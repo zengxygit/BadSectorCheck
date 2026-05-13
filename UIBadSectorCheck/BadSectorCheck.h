@@ -11,6 +11,7 @@
 #include <QPainter>
 #include <ctime>
 #include <vector>
+#include <QRadioButton>
 
 class DiskCheckBase;
 // ─────────────────────────────────────────────────────────────────────
@@ -45,7 +46,12 @@ class DiskCheckThread : public QThread
 {
     Q_OBJECT
 public:
+    // 整盘模式
     explicit DiskCheckThread(DiskCheckBase* pCheck, int diskIndex, QObject* parent = nullptr);
+    // 分区模式
+    explicit DiskCheckThread(DiskCheckBase* pCheck, int diskIndex,
+                             int64_t startSector, int64_t sectorCount,
+                             QObject* parent = nullptr);
     void run() override;
 
 signals:
@@ -54,6 +60,9 @@ signals:
 private:
     DiskCheckBase* m_pCheck;
     int            m_diskIndex;
+    bool           m_bPartitionMode = false;
+    int64_t        m_startSector    = 0;
+    int64_t        m_sectorCount    = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -77,6 +86,7 @@ private slots:
 private:
     void buildUI();
     void populateDiskList();
+    void refreshTargetCombo();
     void resetGrid();
     void updateStats();
     bool isBadSector(int64_t relSecPos) const;
@@ -104,6 +114,8 @@ private:
 
     QPushButton*      m_pStartBtn   = nullptr;
     QPushButton*      m_pStopBtn    = nullptr;
+    QRadioButton*     m_pScanDisk   = nullptr;
+	QRadioButton*     m_pScanPartition = nullptr;
 
     // ── 逻辑 ─────────────────────────────────────────────────────
     DiskCheckBase*   m_pDiskCheck   = nullptr;
